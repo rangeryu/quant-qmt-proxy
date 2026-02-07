@@ -59,10 +59,12 @@ class TradingService:
         self._orders = {}
         self._trades = {}
         self._order_counter = 1000
+        self._xt_trader = None  # XtQuantTrader 实例
+        self._session_id_counter = 100000  # xtquant session id 计数器
         self._try_initialize()
     
     def _try_initialize(self):
-        """尝试初始化xttrader"""
+        """尝试初始化 XtQuantTrader"""
         if not XTQUANT_AVAILABLE:
             self._initialized = False
             return
@@ -72,12 +74,33 @@ class TradingService:
             return
         
         try:
-            # 初始化xttrader
-            # xttrader.connect()
-            self._initialized = True
-            logger.info("xttrader 已初始化")
+            # 获取 miniQMT userdata 路径
+            qmt_path = self.settings.xtquant.data.qmt_userdata_path
+            if not qmt_path:
+                logger.warning("未配置 qmt_userdata_path，无法初始化 XtQuantTrader")
+                self._initialized = False
+                return
+            
+            from xtquant.xttrader import XtQuantTrader
+            
+            # 创建 XtQuantTrader 实例
+            self._session_id_counter += 1
+            self._xt_trader = XtQuantTrader(qmt_path, self._session_id_counter)
+            
+            # 启动交易线程
+            self._xt_trader.start()
+            
+            # 建立连接
+            connect_result = self._xt_trader.connect()
+            if connect_result == 0:
+                self._initialized = True
+                logger.info(f"XtQuantTrader 已初始化并连接成功，path={qmt_path}")
+            else:
+                logger.warning(f"XtQuantTrader 连接失败，返回码: {connect_result}")
+                self._initialized = False
+                
         except Exception as e:
-            logger.warning(f"xttrader 初始化失败: {e}")
+            logger.warning(f"XtQuantTrader 初始化失败: {e}")
             self._initialized = False
     
     def _should_use_real_trading(self) -> bool:
@@ -103,15 +126,22 @@ class TradingService:
         """
         从 session 获取 StockAccount 对象
         用于调用 xtquant 查询接口
+        优先使用 connect_account 时保存的对象
         """
         if not XTQUANT_AVAILABLE:
             return None
         try:
+            # 优先使用 connect_account 时保存的 stock_account 对象
+            session_data = self._connected_accounts.get(session_id)
+            if session_data and "stock_account" in session_data:
+                return session_data["stock_account"]
+            
+            # 降级：重新创建 StockAccount 对象
             from xtquant.xttype import StockAccount
-            account_info = self._connected_accounts[session_id]["account_info"]
+            account_info = session_data["account_info"]
             return StockAccount(account_info.account_id)
         except Exception as e:
-            logger.warning(f"创建 StockAccount 失败: {e}")
+            logger.warning(f"获取 StockAccount 失败: {e}")
             return None
     
     def _convert_xt_position(self, xt_pos) -> PositionInfo:
@@ -222,10 +252,56 @@ class TradingService:
     def connect_account(self, request: ConnectRequest) -> ConnectResponse:
         """连接交易账户"""
         try:
-            # 调用xttrader连接账户
-            # account = xttrader.connect(request.account_id, request.password, request.client_id)
+            session_id = f"session_{request.account_id}_{datetime.now().timestamp()}"
             
-            # 模拟连接成功
+            # 尝试使用真实 xtquant 连接
+            if self._should_use_real_data() and self._initialized and self._xt_trader:
+                try:
+                    from xtquant.xttype import StockAccount
+                    
+                    # 创建 StockAccount 对象
+                    stock_account = StockAccount(request.account_id)
+                    
+                    # 订阅账户，返回0表示成功
+                    subscribe_result = self._xt_trader.subscribe(stock_account)
+                    
+                    if subscribe_result == 0:
+                        logger.info(f"账户 {request.account_id} 订阅成功")
+                        
+                        # 查询真实资产信息
+                        asset = self._xt_trader.query_stock_asset(stock_account)
+                        
+                        account_info = AccountInfo(
+                            account_id=request.account_id,
+                            account_type=AccountType.SECURITY,
+                            account_name=f"账户{request.account_id}",
+                            status="CONNECTED",
+                            balance=asset.cash if asset else 0.0,
+                            available_balance=asset.cash if asset else 0.0,
+                            frozen_balance=asset.frozen_cash if asset else 0.0,
+                            market_value=asset.market_value if asset else 0.0,
+                            total_asset=asset.total_asset if asset else 0.0
+                        )
+                        
+                        self._connected_accounts[session_id] = {
+                            "account_info": account_info,
+                            "connected_time": datetime.now(),
+                            "stock_account": stock_account  # 保存 StockAccount 对象
+                        }
+                        
+                        return ConnectResponse(
+                            success=True,
+                            message="账户连接成功（真实模式）",
+                            session_id=session_id,
+                            account_info=account_info
+                        )
+                    else:
+                        logger.warning(f"账户 {request.account_id} 订阅失败，返回码: {subscribe_result}")
+                        
+                except Exception as e:
+                    logger.warning(f"真实账户连接失败，降级为mock模式: {e}")
+            
+            # Mock 模式或真实连接失败时使用模拟数据
             account_info = AccountInfo(
                 account_id=request.account_id,
                 account_type=AccountType.SECURITY,
@@ -238,7 +314,6 @@ class TradingService:
                 total_asset=1800000.0
             )
             
-            session_id = f"session_{request.account_id}_{datetime.now().timestamp()}"
             self._connected_accounts[session_id] = {
                 "account_info": account_info,
                 "connected_time": datetime.now()
@@ -246,7 +321,7 @@ class TradingService:
             
             return ConnectResponse(
                 success=True,
-                message="账户连接成功",
+                message="账户连接成功（模拟模式）",
                 session_id=session_id,
                 account_info=account_info
             )
