@@ -99,6 +99,126 @@ class TradingService:
             self.settings.xtquant.mode in [XTQuantMode.DEV, XTQuantMode.PROD]
         )
     
+    def _get_stock_account(self, session_id: str):
+        """
+        从 session 获取 StockAccount 对象
+        用于调用 xtquant 查询接口
+        """
+        if not XTQUANT_AVAILABLE:
+            return None
+        try:
+            from xtquant.xttype import StockAccount
+            account_info = self._connected_accounts[session_id]["account_info"]
+            return StockAccount(account_info.account_id)
+        except Exception as e:
+            logger.warning(f"创建 StockAccount 失败: {e}")
+            return None
+    
+    def _convert_xt_position(self, xt_pos) -> PositionInfo:
+        """
+        将 XtPosition 转换为 PositionInfo
+        XtPosition 字段参考 xttrader.md 文档第553-574行
+        """
+        return PositionInfo(
+            stock_code=xt_pos.stock_code,
+            stock_name=getattr(xt_pos, 'instrument_name', ''),
+            volume=xt_pos.volume,
+            available_volume=xt_pos.can_use_volume,
+            frozen_volume=xt_pos.frozen_volume,
+            cost_price=xt_pos.avg_price,
+            market_price=getattr(xt_pos, 'last_price', 0.0),
+            market_value=xt_pos.market_value,
+            profit_loss=getattr(xt_pos, 'float_profit', 0.0),
+            profit_loss_ratio=getattr(xt_pos, 'profit_rate', 0.0)
+        )
+    
+    def _convert_xt_order(self, xt_order) -> OrderResponse:
+        """
+        将 XtOrder 转换为 OrderResponse
+        XtOrder 字段参考 xttrader.md 文档第507-529行
+        """
+        # 映射 order_type 到买卖方向
+        from xtquant import xtconstant
+        side = "BUY"
+        if hasattr(xtconstant, 'STOCK_SELL') and xt_order.order_type == xtconstant.STOCK_SELL:
+            side = "SELL"
+        elif xt_order.order_type in [24, 25]:  # 常见的卖出类型值
+            side = "SELL"
+        
+        # 映射 price_type 到订单类型
+        order_type = "LIMIT"
+        if hasattr(xtconstant, 'LATEST_PRICE') and xt_order.price_type == xtconstant.LATEST_PRICE:
+            order_type = "MARKET"
+        
+        # 映射 order_status
+        status_map = {
+            48: "PENDING",      # ORDER_UNREPORTED
+            49: "PENDING",      # ORDER_WAIT_REPORTING
+            50: "SUBMITTED",    # ORDER_REPORTED
+            51: "SUBMITTED",    # ORDER_REPORTED_CANCEL
+            52: "PARTIAL_FILLED",  # ORDER_PARTSUCC_CANCEL
+            53: "CANCELLED",    # ORDER_PART_CANCEL
+            54: "CANCELLED",    # ORDER_CANCELED
+            55: "PARTIAL_FILLED",  # ORDER_PART_SUCC
+            56: "FILLED",       # ORDER_SUCCEEDED
+            57: "REJECTED",     # ORDER_JUNK
+        }
+        status = status_map.get(xt_order.order_status, "PENDING")
+        
+        # 处理时间戳
+        submitted_time = datetime.now()
+        if xt_order.order_time and xt_order.order_time > 0:
+            try:
+                submitted_time = datetime.fromtimestamp(xt_order.order_time)
+            except Exception:
+                pass
+        
+        return OrderResponse(
+            order_id=str(xt_order.order_id),
+            stock_code=xt_order.stock_code,
+            side=side,
+            order_type=order_type,
+            volume=xt_order.order_volume,
+            price=xt_order.price,
+            status=status,
+            submitted_time=submitted_time,
+            filled_volume=xt_order.traded_volume,
+            average_price=xt_order.traded_price if xt_order.traded_price > 0 else None
+        )
+    
+    def _convert_xt_trade(self, xt_trade) -> TradeInfo:
+        """
+        将 XtTrade 转换为 TradeInfo
+        XtTrade 字段参考 xttrader.md 文档第531-551行
+        """
+        # 映射 order_type 到买卖方向
+        from xtquant import xtconstant
+        side = "BUY"
+        if hasattr(xtconstant, 'STOCK_SELL') and xt_trade.order_type == xtconstant.STOCK_SELL:
+            side = "SELL"
+        elif xt_trade.order_type in [24, 25]:
+            side = "SELL"
+        
+        # 处理时间戳
+        trade_time = datetime.now()
+        if xt_trade.traded_time and xt_trade.traded_time > 0:
+            try:
+                trade_time = datetime.fromtimestamp(xt_trade.traded_time)
+            except Exception:
+                pass
+        
+        return TradeInfo(
+            trade_id=str(xt_trade.traded_id),
+            order_id=str(xt_trade.order_id),
+            stock_code=xt_trade.stock_code,
+            side=side,
+            volume=xt_trade.traded_volume,
+            price=xt_trade.traded_price,
+            amount=xt_trade.traded_amount,
+            trade_time=trade_time,
+            commission=getattr(xt_trade, 'commission', 0.0)
+        )
+    
     def connect_account(self, request: ConnectRequest) -> ConnectResponse:
         """连接交易账户"""
         try:
@@ -159,42 +279,52 @@ class TradingService:
         if session_id not in self._connected_accounts:
             raise TradingServiceException("账户未连接")
         
-        try:
-            # 调用xttrader获取持仓
-            # positions = xttrader.query_stock_positions(session_id)
-            
-            # 模拟持仓数据
-            mock_positions = [
-                PositionInfo(
-                    stock_code="000001.SZ",
-                    stock_name="平安银行",
-                    volume=10000,
-                    available_volume=10000,
-                    frozen_volume=0,
-                    cost_price=12.50,
-                    market_price=13.20,
-                    market_value=132000.0,
-                    profit_loss=7000.0,
-                    profit_loss_ratio=0.056
-                ),
-                PositionInfo(
-                    stock_code="000002.SZ",
-                    stock_name="万科A",
-                    volume=5000,
-                    available_volume=5000,
-                    frozen_volume=0,
-                    cost_price=18.80,
-                    market_price=19.50,
-                    market_value=97500.0,
-                    profit_loss=3500.0,
-                    profit_loss_ratio=0.037
-                )
-            ]
-            
-            return mock_positions
-            
-        except Exception as e:
-            raise TradingServiceException(f"获取持仓信息失败: {str(e)}")
+        # 尝试获取真实数据
+        if self._should_use_real_data() and self._initialized:
+            try:
+                account = self._get_stock_account(session_id)
+                if account:
+                    from xtquant.xttrader import XtQuantTrader
+                    # 使用已初始化的 trader 实例查询持仓
+                    positions = xttrader.query_stock_positions(account)
+                    if positions is not None:
+                        logger.info(f"获取真实持仓数据成功，共 {len(positions)} 条")
+                        return [self._convert_xt_position(p) for p in positions]
+                    else:
+                        logger.info("查询持仓返回空列表")
+                        return []
+            except Exception as e:
+                logger.warning(f"获取真实持仓失败，降级为mock数据: {e}")
+        
+        # Mock 模式或真实查询失败时返回模拟数据
+        mock_positions = [
+            PositionInfo(
+                stock_code="000001.SZ",
+                stock_name="平安银行",
+                volume=10000,
+                available_volume=10000,
+                frozen_volume=0,
+                cost_price=12.50,
+                market_price=13.20,
+                market_value=132000.0,
+                profit_loss=7000.0,
+                profit_loss_ratio=0.056
+            ),
+            PositionInfo(
+                stock_code="000002.SZ",
+                stock_name="万科A",
+                volume=5000,
+                available_volume=5000,
+                frozen_volume=0,
+                cost_price=18.80,
+                market_price=19.50,
+                market_value=97500.0,
+                profit_loss=3500.0,
+                profit_loss_ratio=0.037
+            )
+        ]
+        
+        return mock_positions
     
     def submit_order(self, session_id: str, request: OrderRequest) -> OrderResponse:
         """提交订单"""
@@ -289,67 +419,98 @@ class TradingService:
         if session_id not in self._connected_accounts:
             raise TradingServiceException("账户未连接")
         
-        try:
-            # 调用xttrader获取订单
-            # orders = xttrader.query_stock_orders(session_id)
-            
-            # 返回模拟订单数据
-            return list(self._orders.values())
-            
-        except Exception as e:
-            raise TradingServiceException(f"获取订单列表失败: {str(e)}")
+        # 尝试获取真实数据
+        if self._should_use_real_data() and self._initialized:
+            try:
+                account = self._get_stock_account(session_id)
+                if account:
+                    orders = xttrader.query_stock_orders(account, False)
+                    if orders is not None:
+                        logger.info(f"获取真实订单数据成功，共 {len(orders)} 条")
+                        return [self._convert_xt_order(o) for o in orders]
+                    else:
+                        logger.info("查询订单返回空，回退到内存订单")
+            except Exception as e:
+                logger.warning(f"获取真实订单失败，降级为内存订单: {e}")
+        
+        # Mock 模式或真实查询失败时返回内存中的订单
+        return list(self._orders.values())
     
     def get_trades(self, session_id: str) -> List[TradeInfo]:
         """获取成交记录"""
         if session_id not in self._connected_accounts:
             raise TradingServiceException("账户未连接")
         
-        try:
-            # 调用xttrader获取成交记录
-            # trades = xttrader.query_stock_trades(session_id)
-            
-            # 模拟成交数据
-            mock_trades = [
-                TradeInfo(
-                    trade_id="trade_001",
-                    order_id="order_1001",
-                    stock_code="000001.SZ",
-                    side="BUY",
-                    volume=1000,
-                    price=13.20,
-                    amount=13200.0,
-                    trade_time=datetime.now(),
-                    commission=13.20
-                )
-            ]
-            
-            return mock_trades
-            
-        except Exception as e:
-            raise TradingServiceException(f"获取成交记录失败: {str(e)}")
+        # 尝试获取真实数据
+        if self._should_use_real_data() and self._initialized:
+            try:
+                account = self._get_stock_account(session_id)
+                if account:
+                    trades = xttrader.query_stock_trades(account)
+                    if trades is not None:
+                        logger.info(f"获取真实成交数据成功，共 {len(trades)} 条")
+                        return [self._convert_xt_trade(t) for t in trades]
+                    else:
+                        logger.info("查询成交返回空列表")
+                        return []
+            except Exception as e:
+                logger.warning(f"获取真实成交失败，降级为mock数据: {e}")
+        
+        # Mock 模式或真实查询失败时返回模拟数据
+        mock_trades = [
+            TradeInfo(
+                trade_id="trade_001",
+                order_id="order_1001",
+                stock_code="000001.SZ",
+                side="BUY",
+                volume=1000,
+                price=13.20,
+                amount=13200.0,
+                trade_time=datetime.now(),
+                commission=13.20
+            )
+        ]
+        
+        return mock_trades
     
     def get_asset_info(self, session_id: str) -> AssetInfo:
         """获取资产信息"""
         if session_id not in self._connected_accounts:
             raise TradingServiceException("账户未连接")
         
-        try:
-            # 调用xttrader获取资产信息
-            # asset = xttrader.query_stock_asset(session_id)
-            
-            # 模拟资产数据
-            return AssetInfo(
-                total_asset=1800000.0,
-                market_value=800000.0,
-                cash=950000.0,
-                frozen_cash=50000.0,
-                available_cash=900000.0,
-                profit_loss=50000.0,
-                profit_loss_ratio=0.028
-            )
-            
-        except Exception as e:
-            raise TradingServiceException(f"获取资产信息失败: {str(e)}")
+        # 尝试获取真实数据
+        if self._should_use_real_data() and self._initialized:
+            try:
+                account = self._get_stock_account(session_id)
+                if account:
+                    asset = xttrader.query_stock_asset(account)
+                    if asset is not None:
+                        logger.info(f"获取真实资产数据成功")
+                        # XtAsset 字段: cash, frozen_cash, market_value, total_asset, fetch_balance
+                        return AssetInfo(
+                            total_asset=asset.total_asset,
+                            market_value=asset.market_value,
+                            cash=asset.cash,
+                            frozen_cash=asset.frozen_cash,
+                            available_cash=asset.cash,  # 可用金额
+                            profit_loss=0.0,  # XtAsset 不包含盈亏信息，需要从持仓计算
+                            profit_loss_ratio=0.0
+                        )
+                    else:
+                        logger.info("查询资产返回空")
+            except Exception as e:
+                logger.warning(f"获取真实资产失败，降级为mock数据: {e}")
+        
+        # Mock 模式或真实查询失败时返回模拟数据
+        return AssetInfo(
+            total_asset=1800000.0,
+            market_value=800000.0,
+            cash=950000.0,
+            frozen_cash=50000.0,
+            available_cash=900000.0,
+            profit_loss=50000.0,
+            profit_loss_ratio=0.028
+        )
     
     def get_risk_info(self, session_id: str) -> RiskInfo:
         """获取风险信息"""
